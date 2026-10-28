@@ -23,6 +23,7 @@ const { formatLog } = require('./lib/log-format');
 const { createQueueCrypto } = require('./lib/queue-crypto');
 const { createQueueManager } = require('./lib/queue-manager');
 const { createQueueStore } = require('./lib/queue-store');
+const { registerQueueRecovery } = require('./lib/queue-recovery');
 const { createSpamAssassinClient } = require('./lib/spamassassin-client');
 const {
   containsGtube,
@@ -200,6 +201,7 @@ async function start() {
   await queueStore.migrateQueueItemsFromDatabase(auditStore.db, 'audit-db');
   await queueStore.migrateLegacyQueueFromDatabase(auditStore.db, 'audit-db');
   await queueStore.migrateLegacyQueue(legacyDbPath);
+  registerQueueRecovery(app, queueStore, process.env.WEBHOOK_SECRET);
 
   const localMailTransport = createLocalMailTransport();
   const sendViaCloudflare = createCloudflareDelivery({

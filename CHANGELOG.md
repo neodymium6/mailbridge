@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased (fork)
+
+- Hold exhausted and permanently failed queued mail with encrypted recovery material intact. Add authenticated metadata listing and operator requeue endpoints.
+- Retain rejected R2 messages rather than deleting accepted mail; mark their hold status for review.
+- Upgrade locked body-parser to 2.4.0 to address GHSA-27r3-jxmh-p828.
+- Correct the Debian runtime assertion to the existing 22.23.4 pin.
+- Add retention, migration, restart, pagination, recovery authorization and R2 failure tests. Delivery remains at-least-once.
+
 ## 1.4.3 — 2026-10-23
 
 ### Security

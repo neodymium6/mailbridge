@@ -271,7 +271,7 @@ test('queue manager retries temporary failures and removes delivered messages', 
   );
 });
 
-test('queue manager drops permanently failed messages', async (t) => {
+test('queue manager retains permanently failed messages outside the active queue', async (t) => {
   const harness = await createHarness(t);
   await harness.queueStore.addToQueue('alice@example.com', 'bob@example.com', 'Subject: Fail\r\n\r\nNope', 'sendgrid');
 
@@ -290,6 +290,11 @@ test('queue manager drops permanently failed messages', async (t) => {
 
   const queueRows = await harness.queueStore.listQueueItems();
   assert.equal(queueRows.length, 0);
+
+  assert.equal(await harness.queueStore.countQueueItems(), 1);
+  const held = await harness.queueStore.listHeldItems();
+  assert.equal(held.length, 1);
+  assert.equal(held[0].hold_reason, 'permanent_failure');
 
   const auditRow = await get(
     harness.auditStore.db,
@@ -412,4 +417,75 @@ test('audit log pruning honors AUDIT_LOG_RETENTION_DAYS and event chain is linke
   await harness.auditStore.pruneExpiredEvents();
   rows = await all(harness.auditStore.db, 'SELECT id FROM audit_events ORDER BY id');
   assert.equal(rows.length, 0);
+});
+
+test('exhausted mail survives reopen, does not starve active mail, and can be requeued', async t => {
+  const h = await createHarness(t);
+  const id = await h.queueStore.addToQueue('a@example.com', 'b@example.com', 'Subject: preserved\r\n\r\nretained', 'local_mail', { attempts: 3 });
+  let delivered = 0;
+  const manager = createQueueManager({ store: h.queueStore, auditStore: h.auditStore, maxQueueAttempts: 3,
+    deliverQueuedMessage: async () => { delivered++; } });
+  await manager.processQueue();
+  assert.equal(delivered, 0);
+  assert.equal((await h.queueStore.listHeldItems())[0].hold_reason, 'max_attempts_exceeded');
+  assert.equal(await h.queueStore.countQueueItems(), 1);
+  const bytes = fs.readFileSync(path.join(h.dataDir, 'queue', `${id}.eml`));
+  assert.ok(!bytes.includes(Buffer.from('retained')));
+  // Reopen the actual database with the same keys, as after a service restart.
+  const db = new sqlite3.Database(h.secretsDbPath);
+  const reopened = createQueueStore({ db, dataDir: h.dataDir, queueCrypto: h.queueCrypto, auditStore: h.auditStore });
+  await reopened.init();
+  try {
+    const held = await reopened.listHeldItems();
+    assert.equal(held.length, 1);
+    assert.deepEqual(Object.keys(held[0]).sort(), ['attempts','created_at','held_at','hold_reason','id','target']);
+    assert.equal((await reopened.listQueueItems()).length, 0);
+    await h.queueStore.addToQueue('c@example.com','d@example.com','Subject: next\r\n\r\nnext');
+    await manager.processQueue();
+    assert.equal(delivered, 1);
+    assert.equal(await reopened.retryHeldItem(id), true);
+    assert.equal(await reopened.retryHeldItem(id), false);
+    assert.equal(await reopened.retryHeldItem('missing'), false);
+    assert.equal((await reopened.listQueueItems())[0].attempts, 0);
+    await manager.processQueue();
+    assert.equal(delivered, 2);
+    assert.equal(await reopened.countQueueItems(), 0);
+    assert.equal(fs.existsSync(path.join(h.dataDir, 'queue', `${id}.eml`)), false);
+  } finally { await close(db); }
+});
+
+test('held-item listing paginates and excludes secret material', async t => {
+  const h = await createHarness(t);
+  for (let i=0; i<102; i++) {
+    const id = await h.queueStore.addToQueue('a@example.com','b@example.com','Subject: private\r\n\r\nprivate');
+    await h.queueStore.holdQueueItem(id, 'permanent_failure');
+  }
+  assert.equal((await h.queueStore.listQueueItems()).length, 0);
+  const first = await h.queueStore.listHeldItems();
+  const second = await h.queueStore.listHeldItems(100);
+  assert.equal(first.length,100);
+  assert.equal(second.length,2);
+  assert.equal(new Set([...first,...second].map(row=>row.id)).size,102);
+  assert.ok(!JSON.stringify(first).includes('per_message_secret'));
+  await assert.rejects(h.queueStore.listHeldItems(-1), /Invalid offset/);
+});
+
+test('damaged retained mail cannot be requeued and remains held', async t => {
+  const h = await createHarness(t);
+  const id = await h.queueStore.addToQueue('a@example.com','b@example.com','Subject: held\r\n\r\nheld');
+  await h.queueStore.holdQueueItem(id,'permanent_failure');
+  fs.writeFileSync(path.join(h.dataDir,'queue',`${id}.eml`),'broken');
+  await assert.rejects(h.queueStore.retryHeldItem(id));
+  assert.equal((await h.queueStore.listHeldItems()).length,1);
+});
+
+test('old queue schema migrates without losing encrypted messages', async t => {
+  const h=await createHarness(t);
+  const id=await h.queueStore.addToQueue('a@example.com','b@example.com','Subject: old\r\n\r\nold');
+  await run(h.secretsDb,'ALTER TABLE queue_items DROP COLUMN held_at');
+  await run(h.secretsDb,'ALTER TABLE queue_items DROP COLUMN hold_reason');
+  await h.queueStore.init();
+  await h.queueStore.init();
+  assert.equal((await h.queueStore.listQueueItems())[0].id,id);
+  assert.equal((await h.queueStore.loadQueuedMessage((await h.queueStore.listQueueItems())[0])).rawContent,'Subject: old\r\n\r\nold');
 });

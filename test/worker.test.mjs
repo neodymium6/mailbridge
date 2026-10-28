@@ -114,18 +114,19 @@ function queueFixture() {
   const encryptedPayload = { version: 'v1', algorithm: 'test', wrappedKey: 'key', iv: 'iv', ciphertext: 'cipher' };
   const object = { text: async () => JSON.stringify(encryptedPayload), customMetadata: { encryptionVersion: 'v1' } };
   const env = { WEBHOOK_SECRET: 'test-secret', NODE_APP_URL: 'https://bridge.example',
-    MAIL_STORE: { get: async () => object, delete: async () => { state.deleted++; } } };
+    MAIL_STORE: { get: async () => object, put: async (key, value, options) => { object.customMetadata = options.customMetadata; }, delete: async () => { state.deleted++; } } };
   const msg = { body, attempts: 1, ack: () => { state.acked++; }, retry: () => { state.retried++; } };
   return { state, body, env, msg };
 }
 
-test('Worker retries infrastructure failures and discards only explicit mail rejections', async t => {
+test('Worker retries infrastructure failures and retains explicit rejections in R2', async t => {
   for (const status of [401, 403, 404, 408, 409, 429, 500, 503, 400, 406, 413, 422]) {
     const { state, env, msg } = queueFixture();
     t.mock.method(globalThis, 'fetch', async () => new Response('Failure', { status }));
     await worker.queue({ messages: [msg] }, env);
     const permanent = [400, 406, 413, 422].includes(status);
-    assert.deepEqual(state, { deleted: +permanent, acked: +permanent, retried: +!permanent }, `HTTP ${status}`);
+    assert.deepEqual(state, { deleted: 0, acked: +permanent, retried: +!permanent }, `HTTP ${status}`);
+    if (permanent) assert.equal((await env.MAIL_STORE.get()).customMetadata.holdStatus, String(status));
     t.mock.restoreAll();
   }
 });
@@ -240,4 +241,33 @@ test('Worker send endpoint accepts both legacy and recipient-preserving payloads
     assert.equal(response.status, 200);
     assert.deepEqual(sent, payload);
   }
+});
+
+test('failed quarantine metadata write retries without deleting R2 ciphertext', async t => {
+  const {state,env,msg}=queueFixture();
+  t.mock.method(globalThis,'fetch',async()=>new Response('Rejected',{status:422}));
+  env.MAIL_STORE.put=async()=>{throw new Error('R2 unavailable');};
+  await worker.queue({messages:[msg]},env);
+  assert.deepEqual(state,{deleted:0,acked:0,retried:1});
+});
+
+
+test('rejected R2 body is consumed once and retained byte-for-byte', async t => {
+  const {state,env,msg}=queueFixture();
+  const ciphertext=JSON.stringify({version:'v1',ciphertext:'synthetic-encrypted-message'});
+  let consumed=false;
+  let retained;
+  env.MAIL_STORE.get=async()=>({
+    text:async()=>{assert.equal(consumed,false);consumed=true;return ciphertext;},
+    customMetadata:{encryptionVersion:'v1',receivedAt:'2026-01-01'},
+    httpMetadata:{contentType:'application/json'}
+  });
+  env.MAIL_STORE.put=async(key,body,options)=>{retained={key,body,options};};
+  t.mock.method(globalThis,'fetch',async()=>new Response('Rejected',{status:422}));
+  await worker.queue({messages:[msg]},env);
+  assert.deepEqual(state,{deleted:0,acked:1,retried:0});
+  assert.equal(retained.body,ciphertext);
+  assert.equal(retained.key,msg.body.objectKey);
+  assert.equal(retained.options.customMetadata.encryptionVersion,'v1');
+  assert.equal(retained.options.customMetadata.holdStatus,'422');
 });

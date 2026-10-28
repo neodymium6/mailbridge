@@ -196,7 +196,7 @@ Read the complete [Security Model](https://github.com/imrasalghul/mailbridge/wik
 
 The Worker supplies a stable delivery identity for each R2 object. With MAILBRIDGE_DELIVERY_RECEIPTS=true (the modern default), Mailbridge stores completed outcomes in `DATA_DIR/delivery-receipts.db`; repeated or concurrent handoffs reuse those outcomes. This prevents another SMTP delivery when the original HTTP response or R2 cleanup fails. Back up this database along with the queue and its keys, and retain it while an R2 object or queue reference might still be replayed. Receipts contain identifiers, hashes, and generic outcomes, not raw mail. SMTP itself cannot guarantee exactly-once delivery if the process crashes after the remote server accepts mail but before the receipt is saved, or if the SMTP acknowledgement is lost.
 
-SMTP 4xx failures enter the encrypted local retry queue; SMTP 5xx rejections return HTTP 422. The Worker deletes rejected mail only for explicit HTTP 400, 406, 413, or 422 responses. Authentication, configuration, timeout, throttling, and server failures retry without deleting R2 ciphertext.
+SMTP 4xx failures enter the encrypted local retry queue; SMTP 5xx rejections return HTTP 422. For HTTP 400, 406, 413, or 422, the Worker retains encrypted mail in R2 with `heldAt` and `holdStatus` metadata and acknowledges the queue reference to stop automatic retries. Authentication, configuration, timeout, throttling, and server failures retry without deleting R2 ciphertext.
 
 Fresh modern setup creates `mailbridge-inbound-dead-letter` before deployment. Existing installations can opt in with `MAILBRIDGE_DEAD_LETTER_QUEUE=true` when rerunning setup, or create the queue manually and add `dead_letter_queue = "mailbridge-inbound-dead-letter"` to their queue consumer, using the actual queue name if customized. Monitor this queue: [Cloudflare moves exhausted messages to the dead-letter queue](https://developers.cloudflare.com/queues/configuration/dead-letter-queues/), whose retention is finite. The encrypted R2 object remains available for recovery even after its queue reference expires, unless a bucket lifecycle rule removes it.
 
@@ -215,6 +215,62 @@ NODE
 ```
 
 Replace the Worker hostname and object key. HTTP 202 means the encrypted reference was queued again; acknowledge the old dead-letter entry after this succeeds. The outbound-only secret cannot authorize recovery. Enable backend receipt support before replaying mail that might already have been accepted. Deploy the backend before the Worker when adopting modern behavior, then verify with synthetic staging mail. Legacy mode deliberately retains repeated-delivery semantics.
+
+### Retained local mail (this fork)
+
+Local retry exhaustion and permanent queued-delivery failures now hold the item
+instead of deleting it. Encrypted files and per-message keys stay in their
+original locations. Held items are excluded from automatic processing, so they
+do not block newer mail. Successful delivery still removes its queued copy.
+A schema migration adds nullable `held_at` and `hold_reason` fields; existing
+active items remain active. This retention behavior applies to both profiles.
+
+Monitor error logs for `Held for operator recovery` and poll the authenticated
+`GET /api/queue/held` endpoint. It returns up to 100 metadata-only items; use
+`?offset=100` for subsequent pages. No addresses, message bodies or encryption
+keys are returned. Empty lists do not report R2-held or dead-letter messages;
+monitor those separately. This fork does not send external notifications.
+
+After correcting the cause, `POST /api/queue/held/:id/retry` resets a held item's
+attempt counter and returns it to the active queue. The usual queue interval
+then processes it. It does not resend immediately. Missing/non-held IDs return
+404; unreadable or undecryptable mail returns 503 and stays held. Both endpoints
+require `X-Webhook-Secret` with the existing inbound secret. Restrict their
+network exposure to administrators; this credential authorizes recovery as well
+as inbound delivery. Do not put it into shell arguments, browser URLs or logs.
+
+Example, run on the backend with its existing environment file:
+
+```sh
+node --env-file=.env --input-type=module <<'NODE'
+const base = 'http://127.0.0.1:3090';
+const headers = { 'X-Webhook-Secret': process.env.WEBHOOK_SECRET };
+const response = await fetch(`${base}/api/queue/held`, { headers });
+if (!response.ok) throw new Error(`Queue listing failed: ${response.status}`);
+console.log(await response.json());
+// After inspecting an ID and correcting the underlying problem:
+// const id = 'replace-with-held-queue-id';
+// const retry = await fetch(`${base}/api/queue/held/${encodeURIComponent(id)}/retry`,
+//   { method: 'POST', headers });
+// console.log(retry.status); // 202 means requeued, not delivered.
+NODE
+```
+
+R2 rejects are separate from the local queue. They keep the original object key
+and are discoverable through `heldAt`/`holdStatus` metadata and Worker logs. The
+existing `/api/replay/email` endpoint can queue a reference again, but a completed
+permanent backend receipt can still return its cached rejection. Do not repeatedly
+replay or delete receipt records blindly: inspect the rejection and recover/export
+the retained message deliberately. In particular, spam rejects remain rejected.
+Do not configure R2 lifecycle deletion if indefinite recovery is required.
+Retention consumes disk/R2 capacity; monitor growth and review held mail regularly.
+
+Back up queue files, `secrets.db`, the master key, private decryption key and
+receipt database together. No automatic expiry/purge is introduced. Acknowledged
+SMTP delivery can still duplicate after a crash; exactly-once delivery is not
+claimed. Before downgrading, stop the service and back up all state: an older
+binary does not understand held rows and may retry or delete them. Do not run
+mixed old/new backends against the same queue database.
 
 ## Documentation
 

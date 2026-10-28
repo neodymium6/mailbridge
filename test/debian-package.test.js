@@ -44,7 +44,7 @@ test('package scripts preserve configuration and queued mail across removal', ()
 
 test('Debian builder pins and verifies the bundled Node runtime', () => {
   const builder = read('packaging/debian/build-deb.sh');
-  assert.match(builder, /node_version="\$\{NODE_VERSION:-22\.23\.3\}"/);
+  assert.match(builder, /node_version="\$\{NODE_VERSION:-22\.23\.4\}"/);
   assert.match(builder, /SHASUMS256\.txt/);
   assert.match(builder, /sha256sum -c/);
   assert.match(builder, /npm ci --omit=dev/);

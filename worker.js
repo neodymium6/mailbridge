@@ -90,8 +90,9 @@ export default {
           continue;
         }
 
+        const storedText = await object.text();
         const requestBody = await buildBridgeRequestBody({
-          object,
+          object: { text: async () => storedText },
           objectKey,
           payload,
         });
@@ -129,12 +130,12 @@ export default {
           objectKey,
           status: response.status,
         });
-        await deleteStoredMessageOrRetry({
-          env,
-          msg,
-          objectKey,
-          reason: "permanent bridge failure",
+        await env.MAIL_STORE.put(objectKey, storedText, {
+          httpMetadata: object.httpMetadata,
+          customMetadata: { ...object.customMetadata, heldAt: new Date().toISOString(), holdStatus: String(response.status) },
         });
+        console.error("mail retained in R2 for operator recovery", { objectKey, status: response.status });
+        msg.ack();
       } catch (err) {
         console.error("queue() failed", {
           objectKey,
@@ -328,22 +329,6 @@ async function getPublicKey(env) {
   }
 
   return cachedPublicKeyPromise;
-}
-
-async function deleteStoredMessageOrRetry({ env, msg, objectKey, reason }) {
-  try {
-    await env.MAIL_STORE.delete(objectKey);
-    console.log("deleted object before ack", { objectKey, reason });
-    msg.ack();
-  } catch (err) {
-    console.error("failed to delete object before ack", {
-      objectKey,
-      reason,
-      message: err?.message || String(err),
-      stack: err?.stack || null,
-    });
-    msg.retry({ delaySeconds: getRetryDelaySeconds(msg.attempts) });
-  }
 }
 
 function makeObjectKey({ receivedAt, id }) {
